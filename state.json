@@ -1,6 +1,6 @@
 {
  "cash": 297.55983816759715,
- "peak": 1000.0,
+ "peak": 1002.0915306391162,
  "positions": {
   "STRK-USD": {
    "entry": 0.032422389999999995,
@@ -151,7 +151,7 @@
    "pnl": 0.0
   }
  },
- "cycle": 11,
+ "cycle": 12,
  "halted": false,
  "disabled": {},
  "tuned": {
