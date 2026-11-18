@@ -121,8 +121,8 @@ STRATS = {
     "random":   dict(kind="random",               p=dict(**pct_exit(.03, .06, 24))),                  # CONTROL: buys at random. Real strategies must beat this.
 }
 
-def candidates(spec, done):
-    p, kind = spec["p"], spec["kind"]
+def candidates(spec, done, p=None):
+    p, kind = (p or spec["p"]), spec["kind"]
     if kind == "sig":
         return [pid for pid, df in done.items() if len(df) > 120 and bool(spec["fn"](df, p).fillna(False).iloc[-1])]
     if kind == "rank":
@@ -150,6 +150,67 @@ def new_pos(entry, a, p):
 
 def net_return(entry, exit_px):
     return exit_px * (1 - CFG["slip"]) / entry * (1 - CFG["fee"]) ** 2 - 1
+
+
+# ---------------- OPTIMIZATION LAB ----------------
+def _atr_exits(): return [dict(stop_atr=a, tp_atr=b, max_hold=h) for a in (2, 3) for b in (4, 8) for h in (48, 96)]
+def _pct(stops, tps, holds): return [pct_exit(s_, t_, h_) for s_ in stops for t_ in tps for h_ in holds]
+LAB = {
+    "breakout": ([dict(n=n) for n in (24, 48, 96)], _atr_exits()),
+    "meanrev":  ([dict(rsi=r) for r in (20, 25, 30, 35)], _atr_exits()),
+    "trend":    ([dict(fast=f, slow=sl) for f, sl in ((8, 32), (12, 48), (24, 96))], _atr_exits()),
+    "spike":    ([dict(n=n, thr=t, vm=2.0) for n in (3, 6, 12) for t in (.02, .03, .05)], _atr_exits()),
+    "knife":    ([dict(drop=d) for d in (.05, .08, .12)], _pct((.04, .06, .10), (.06, .10, .15), (24, 48))),
+    "scalp":    ([dict(thr=t, vm=2.0) for t in (.008, .012, .02)], _pct((.008, .012, .02), (.015, .025, .04), (4, 8))),
+    "moonshot": ([dict(thr=t, vm=3.0) for t in (.06, .10, .15)], _pct((.05, .08, .12), (.5,), (48, 96))),
+}
+
+def backtest(df, sig, a, p):
+    """Replay one strategy on one coin's history. Returns [(position in history 0-1, net return after fees)]."""
+    o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
+    sg = sig.fillna(False).values; av = None if a is None else a.values
+    out, i, n = [], 0, len(df)
+    while i < n - 1:
+        if sg[i] and (av is None or av[i] > 0):
+            ent = o[i + 1] * (1 + CFG["slip"])
+            pos = new_pos(ent, None if av is None else av[i], p)
+            j, ex = i + 1, None
+            while j < n:
+                ex = check_exit(pos, h[j], l[j], c[j])
+                if ex is not None: break
+                j += 1
+            if ex is None: ex, j = c[n - 1], n - 1
+            out.append((i / n, net_return(ent, ex))); i = j + 1
+        else:
+            i += 1
+    return out
+
+def run_lab(pairs, log=print):
+    """Replay every strategy with many setting combinations on real Coinbase history; keep the best per strategy."""
+    dfs = {}
+    for pid in pairs:
+        h = history(pid, 900)
+        if h is not None and len(h) > 400: dfs[pid] = h
+    atrs = {k: atr(d) for k, d in dfs.items()}
+    results, tested = [], 0
+    for name, (sgrid, egrid) in LAB.items():
+        fn, best = STRATS[name]["fn"], None
+        for sp in sgrid:
+            sigs = {k: fn(d, sp) for k, d in dfs.items()}
+            for ep in egrid:
+                tested += 1
+                p = {**sp, **ep}; use_atr = "stop_pct" not in ep
+                allr = []
+                for k, d in dfs.items(): allr += backtest(d, sigs[k], atrs[k] if use_atr else None, p)
+                n = len(allr)
+                if n < 15: continue
+                rets = [r for _, r in allr]; recent = [r for f, r in allr if f >= 0.7]
+                avg = float(np.mean(rets)); score = avg * np.sqrt(n)
+                if best is None or score > best[0]:
+                    best = (score, dict(name=name, params=p, n=n, avg=avg, win=float(np.mean([r > 0 for r in rets])),
+                                        test_n=len(recent), test_avg=float(np.mean(recent)) if len(recent) >= 5 else None))
+        if best: results.append(best[1]); log(f"  lab {name}: best avg {best[1]['avg']:+.2%} over {best[1]['n']} trades")
+    return dict(updated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), pairs=len(dfs), tested=tested, results=results)
 
 # ---------------- STATE ----------------
 def blank_stats(): return dict(n=0, sum=0.0, wins=0, pnl=0.0)
@@ -185,6 +246,15 @@ def cycle(st):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     print(f"\n[{ts}] cycle {st['cycle']}: scanning all USD pairs...")
     pairs = scan()
+    if st["cycle"] - st.get("lab_cycle", -999) >= 24:     # optimization lab: once a day
+        print("  running optimization lab on real history...")
+        try:
+            lab = run_lab(pairs[:30])
+            st["tuned"] = {r["name"]: r["params"] for r in lab["results"]}
+            st["lab_cycle"] = st["cycle"]
+            json.dump(lab, open("lab.json", "w"), default=_js)
+        except Exception as e:
+            print("  lab error:", e)
     data = {}
     for pid in dict.fromkeys(pairs + list(st["positions"])):
         df = history(pid, bars=300)
@@ -228,9 +298,9 @@ def cycle(st):
     if not st["halted"]:
         for name, spec in STRATS.items():
             if name in st["disabled"]: continue
-            p = spec["p"]
+            p = st.get("tuned", {}).get(name, spec["p"])
             mine = sum(1 for q in st["positions"].values() if q["strategy"] == name)
-            try: cands = candidates(spec, done)
+            try: cands = candidates(spec, done, p)
             except Exception as e:
                 print(f"  {name} error: {e}"); continue
             for pid in cands:
@@ -274,7 +344,8 @@ def record(st, last, eq, ts):
                                pnl=s_["pnl"], avg=(s_["sum"] / s_["n"]) if s_["n"] else 0, weight=weight(st, k),
                                open=sum(1 for q in st["positions"].values() if q["strategy"] == k)))
     out = dict(updated=ts, equity=eq, start_equity=CFG["start_equity"], cash=st["cash"], peak=st["peak"], halted=st["halted"],
-               cycle=st["cycle"], positions=positions, strategies=strategies, trades=trades[-500:], curve=curve)
+               cycle=st["cycle"], positions=positions, strategies=strategies, trades=trades[-500:], curve=curve,
+               lab=(json.load(open("lab.json")) if os.path.exists("lab.json") else None))
     json.dump(out, open(DATA_FILE, "w"), default=_js)
 
 def report():
