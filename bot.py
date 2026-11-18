@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
 """
-Coinbase spot PAPER trading bot: scan -> optimize -> trade -> learn -> compound.
-No API keys needed (public market data only). No real orders are ever placed.
+Coinbase spot PAPER trading TOURNAMENT. Real market data, fake money, no API keys, no real orders.
+9 strategies (some deliberately wild) trade at once from one $1,000 paper wallet.
+The Dashboard leaderboard shows which ones actually make money. Losers get paused, then retried later.
 
-Usage:
-  pip install requests pandas numpy
-  python bot.py optimize   # test strategies on history, show what (if anything) has an edge
-  python bot.py run        # hourly paper-trading loop
-  python bot.py report     # show equity, trades, per-strategy stats
+  python bot.py once     # one cycle (used by GitHub Actions every hour)
+  python bot.py run      # loop forever (on a computer)
+  python bot.py report   # print the leaderboard
 """
-import sys, json, time, itertools, os
+import sys, json, time, os, random
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import requests
 
-# ---------------- CONFIG ----------------
 CFG = dict(
     start_equity=1000.0,
-    fee=0.006,          # per side. VERIFY your Coinbase fee tier; this is deliberately conservative
-    slip=0.001,         # per side slippage assumption
-    risk_per_trade=0.01,   # risk 1% of equity per trade (stop distance sizes the position)
-    max_pos_pct=0.20,      # max 20% of equity in one coin
-    max_positions=5,
-    max_drawdown=0.15,     # kill switch: stop opening trades at -15% from peak
-    top_pairs=30,          # liquid pairs to trade
-    min_usd_vol=500_000,   # min 24h USD volume
-    reopt_every=24,        # re-optimize every N cycles (hours)
-    min_train_trades=20, min_test_trades=8, min_test_expectancy=0.003,
+    fee=0.006,            # per side. Verify your Coinbase fee tier.
+    slip=0.001,           # per side slippage assumption
+    risk_per_trade=0.02,  # aggressive: risk 2% of equity per trade
+    max_pos_pct=0.10,     # max 10% of the wallet in one coin
+    max_positions=12, per_strategy_max=2,
+    max_drawdown=0.50,    # paper money: only stop new trades after a 50% drop
+    top_pairs=80, min_usd_vol=150_000,
+    pause_after=25, pause_cycles=48,   # pause a strategy that is net-negative after 25 trades; retry 48h later
 )
 STATE_FILE, TRADES_FILE, EQUITY_FILE, DATA_FILE = "state.json", "trades.csv", "equity.csv", "data.json"
 API = "https://api.exchange.coinbase.com"
 COLS = ["t", "low", "high", "open", "close", "volume"]
+TRADE_COLS = ["time", "pair", "strategy", "entry", "exit", "qty", "ret", "pnl", "fees"]
 
 # ---------------- DATA ----------------
 def get(path, params=None):
@@ -49,7 +46,7 @@ def usd_pairs():
             if p["quote_currency"] == "USD" and p["status"] == "online"
             and not p.get("trading_disabled") and not p.get("auction_mode")]
 
-def history(pid, bars=900, gran=3600):
+def history(pid, bars=300, gran=3600):
     out, end = [], datetime.now(timezone.utc)
     while sum(len(x) for x in out) < bars:
         start = end - timedelta(seconds=gran * 300)
@@ -62,7 +59,7 @@ def history(pid, bars=900, gran=3600):
     return df.tail(bars).reset_index(drop=True)
 
 def scan():
-    """Rank ALL USD pairs by 24h dollar volume; return the most liquid."""
+    """Check ALL Coinbase USD pairs; return the most active ones (by 24h dollar volume)."""
     ranked = []
     for pid in usd_pairs():
         try:
@@ -74,7 +71,7 @@ def scan():
     ranked.sort(reverse=True)
     return [p for _, p in ranked[:CFG["top_pairs"]]]
 
-# ---------------- INDICATORS / STRATEGIES ----------------
+# ---------------- INDICATORS ----------------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rsi(s, n=14):
@@ -88,95 +85,85 @@ def atr(df, n=14):
     tr = pd.concat([df.high - df.low, (df.high - pc).abs(), (df.low - pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
-def sig_breakout(df, p):
-    hh = df.high.rolling(p["n"]).max().shift(1)
-    return (df.close > hh) & (df.volume > 1.5 * df.volume.rolling(24).mean()) & (df.close > ema(df.close, 100))
+def vol_x(df, m): return df.volume > m * df.volume.rolling(24).mean()
 
-def sig_meanrev(df, p):
+# ---------------- STRATEGIES ----------------
+def sig_breakout(df, p):   # price breaks its recent high on heavy volume
+    return (df.close > df.high.rolling(p["n"]).max().shift(1)) & vol_x(df, 1.5) & (df.close > ema(df.close, 100))
+def sig_meanrev(df, p):    # oversold bounce
     m, s = df.close.rolling(20).mean(), df.close.rolling(20).std()
     return (rsi(df.close) < p["rsi"]) & (df.close < m - 2 * s)
-
-def sig_trend(df, p):
+def sig_trend(df, p):      # fast average crosses above slow average
     f, sl = ema(df.close, p["fast"]), ema(df.close, p["slow"])
     return (f > sl) & (f.shift() <= sl.shift()) & (rsi(df.close) > 50)
+def sig_spike(df, p):      # sharp rise on heavy volume, still above trend
+    ret = df.close / df.close.shift(p["n"]) - 1
+    return (ret > p["thr"]) & vol_x(df, p["vm"]) & (rsi(df.close) < 80) & (df.close > ema(df.close, 50))
+def sig_knife(df, p):      # WILD: catch a falling knife (dropped hard in 24h and deeply oversold)
+    return (df.close / df.close.shift(24) - 1 < -p["drop"]) & (rsi(df.close) < 25)
+def sig_scalp(df, p):      # WILD: tiny quick trades on a 1-hour pop with volume
+    return (df.close / df.close.shift(1) - 1 > p["thr"]) & vol_x(df, p["vm"])
+def sig_moon(df, p):       # WILD: chase coins already up 10%+ in a day on huge volume
+    return (df.close / df.close.shift(24) - 1 > p["thr"]) & vol_x(df, p["vm"])
 
-EXIT_GRID = [dict(stop_atr=a, tp_atr=b, max_hold=h) for a in (2, 3) for b in (3, 6) for h in (24, 72)]
+ATR_EXIT = dict(stop_atr=2, tp_atr=6, max_hold=72)
+def pct_exit(stop, tp, hold): return dict(stop_pct=stop, tp_pct=tp, max_hold=hold)
+
 STRATS = {
-    "breakout": (sig_breakout, [dict(n=n) for n in (20, 48, 96)]),
-    "meanrev":  (sig_meanrev,  [dict(rsi=r) for r in (25, 30, 35)]),
-    "trend":    (sig_trend,    [dict(fast=f, slow=s) for f, s in ((12, 48), (24, 96), (8, 32))]),
+    "breakout": dict(kind="sig", fn=sig_breakout, p=dict(n=48, **ATR_EXIT)),
+    "meanrev":  dict(kind="sig", fn=sig_meanrev,  p=dict(rsi=30, **ATR_EXIT)),
+    "trend":    dict(kind="sig", fn=sig_trend,    p=dict(fast=12, slow=48, **ATR_EXIT)),
+    "spike":    dict(kind="sig", fn=sig_spike,    p=dict(n=6, thr=0.03, vm=2.0, **ATR_EXIT)),
+    "knife":    dict(kind="sig", fn=sig_knife,    p=dict(drop=0.08, **pct_exit(.06, .08, 48))),
+    "scalp":    dict(kind="sig", fn=sig_scalp,    p=dict(thr=0.012, vm=2.0, **pct_exit(.012, .02, 6))),
+    "moonshot": dict(kind="sig", fn=sig_moon,     p=dict(thr=0.10, vm=3.0, **pct_exit(.08, .50, 72))),
+    "gainers":  dict(kind="rank",                 p=dict(k=2, min=0.03, **pct_exit(.05, .15, 48))),   # top 24h gainers across ALL pairs
+    "random":   dict(kind="random",               p=dict(**pct_exit(.03, .06, 24))),                  # CONTROL: buys at random. Real strategies must beat this.
 }
 
-# ---------------- SHARED EXIT LOGIC (same code in backtest and live) ----------------
+def candidates(spec, done):
+    p, kind = spec["p"], spec["kind"]
+    if kind == "sig":
+        return [pid for pid, df in done.items() if len(df) > 120 and bool(spec["fn"](df, p).fillna(False).iloc[-1])]
+    if kind == "rank":
+        r = {pid: df.close.iloc[-1] / df.close.iloc[-25] - 1 for pid, df in done.items() if len(df) > 30}
+        top = sorted(r, key=r.get, reverse=True)[:p["k"]]
+        return [x for x in top if r[x] >= p["min"]]
+    return [random.choice(list(done))] if done else []
+
+# ---------------- EXIT LOGIC ----------------
 def check_exit(pos, high, low, close):
-    """Update position with one completed bar; return exit price or None. Stop checked first (conservative)."""
     pos["bars"] += 1
     if low <= pos["stop"]: return pos["stop"]
     if high >= pos["tp"]: return pos["tp"]
     pos["hi"] = max(pos["hi"], high)
-    pos["stop"] = max(pos["stop"], pos["hi"] - pos["stop_atr"] * pos["atr"])  # trailing stop
+    pos["stop"] = max(pos["stop"], pos["hi"] - pos["stop_atr"] * pos["atr"])   # trailing stop
     if pos["bars"] >= pos["max_hold"]: return close
     return None
 
 def new_pos(entry, a, p):
-    return dict(entry=entry, atr=a, stop=entry - p["stop_atr"] * a, tp=entry + p["tp_atr"] * a,
-                hi=entry, bars=0, stop_atr=p["stop_atr"], max_hold=p["max_hold"])
+    if "stop_pct" in p:
+        d = entry * p["stop_pct"]
+        return dict(entry=entry, atr=d, stop=entry - d, tp=entry * (1 + p["tp_pct"]), hi=entry, bars=0, stop_atr=1, max_hold=p["max_hold"])
+    return dict(entry=entry, atr=a, stop=entry - p["stop_atr"] * a, tp=entry + p["tp_atr"] * a, hi=entry, bars=0,
+                stop_atr=p["stop_atr"], max_hold=p["max_hold"])
 
 def net_return(entry, exit_px):
     return exit_px * (1 - CFG["slip"]) / entry * (1 - CFG["fee"]) ** 2 - 1
 
-# ---------------- BACKTEST ----------------
-def backtest(df, sig, a, p):
-    o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
-    sig = sig.fillna(False).values; av = a.values
-    rets, i, n = [], 0, len(df)
-    while i < n - 1:
-        if sig[i] and av[i] > 0:
-            ent = o[i + 1] * (1 + CFG["slip"])           # signal on close of bar i, fill at next open
-            pos, j, ex = new_pos(ent, av[i], p), i + 1, None
-            while j < n:
-                ex = check_exit(pos, h[j], l[j], c[j])
-                if ex is not None: break
-                j += 1
-            if ex is None: ex, j = c[n - 1], n - 1
-            rets.append(net_return(ent, ex)); i = j + 1
-        else:
-            i += 1
-    return rets
-
-def optimize(dfs, log=print):
-    """Pick params per strategy on first 70% of data; accept ONLY if still profitable on last 30%."""
-    split = {k: (d.iloc[:int(len(d) * .7)].reset_index(drop=True),
-                 d.iloc[int(len(d) * .7):].reset_index(drop=True)) for k, d in dfs.items()}
-    atrs = {k: (atr(tr), atr(te)) for k, (tr, te) in split.items()}
-    result = {}
-    for name, (fn, grid) in STRATS.items():
-        best = None
-        for sp in grid:
-            sigs = {k: (fn(tr, sp), fn(te, sp)) for k, (tr, te) in split.items()}
-            for ep in EXIT_GRID:
-                p = {**sp, **ep}
-                tr_r = [r for k in split for r in backtest(split[k][0], sigs[k][0], atrs[k][0], p)]
-                if len(tr_r) < CFG["min_train_trades"]: continue
-                score = np.mean(tr_r) * np.sqrt(len(tr_r))
-                if best is None or score > best[0]: best = (score, p, np.mean(tr_r), len(tr_r), sigs)
-        if not best:
-            log(f"  {name}: not enough trades to evaluate"); continue
-        _, p, tr_exp, tr_n, sigs = best
-        te_r = [r for k in split for r in backtest(split[k][1], sigs[k][1], atrs[k][1], p)]
-        te_exp = float(np.mean(te_r)) if te_r else 0.0
-        ok = len(te_r) >= CFG["min_test_trades"] and te_exp >= CFG["min_test_expectancy"]
-        log(f"  {name}: train {tr_exp:+.2%} ({tr_n} trades) | test {te_exp:+.2%} ({len(te_r)}) -> "
-            f"{'ENABLED' if ok else 'rejected (no out-of-sample edge)'}")
-        if ok: result[name] = p
-    return result
-
 # ---------------- STATE ----------------
+def blank_stats(): return dict(n=0, sum=0.0, wins=0, pnl=0.0)
+
 def load():
     if os.path.exists(STATE_FILE):
-        return json.load(open(STATE_FILE))
-    return dict(cash=CFG["start_equity"], peak=CFG["start_equity"], positions={}, params={},
-                stats={k: dict(n=0, sum=0.0) for k in STRATS}, cycle=0, halted=False)
+        st = json.load(open(STATE_FILE))
+        st.setdefault("stats", {}); st.setdefault("disabled", {})
+        for k in STRATS:
+            s = st["stats"].setdefault(k, blank_stats())
+            for f, v in blank_stats().items(): s.setdefault(f, v)
+        return st
+    return dict(cash=CFG["start_equity"], peak=CFG["start_equity"], positions={}, disabled={},
+                stats={k: blank_stats() for k in STRATS}, cycle=0, halted=False)
 
 def save(st): json.dump(st, open(STATE_FILE, "w"), indent=1)
 
@@ -184,133 +171,125 @@ def log_trade(row):
     pd.DataFrame([row]).to_csv(TRADES_FILE, mode="a", header=not os.path.exists(TRADES_FILE), index=False)
 
 def weight(st, name):
-    """Learning: shrunk live expectancy -> capital weight. Losers get cut to a floor, winners up to 2x."""
+    """Learning: strategies that win live get more capital (up to 2x); losers shrink (down to 0.25x)."""
+    if name == "random": return 1.0
     s = st["stats"][name]
-    exp = s["sum"] / (s["n"] + 10)
-    return float(np.clip(1 + exp * 50, 0.25, 2.0))
+    return float(np.clip(1 + (s["sum"] / (s["n"] + 10)) * 50, 0.25, 2.0))
 
 def equity(st, last):
     return st["cash"] + sum(p["qty"] * last.get(k, p["entry"]) for k, p in st["positions"].items())
 
-# ---------------- LIVE (PAPER) CYCLE ----------------
+# ---------------- ONE CYCLE ----------------
 def cycle(st):
     st["cycle"] += 1
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     print(f"\n[{ts}] cycle {st['cycle']}: scanning all USD pairs...")
     pairs = scan()
-    held = list(st["positions"])
     data = {}
-    for pid in dict.fromkeys(pairs + held):
+    for pid in dict.fromkeys(pairs + list(st["positions"])):
         df = history(pid, bars=300)
-        if df is not None and len(df) > 150: data[pid] = df
+        if df is not None and len(df) > 60: data[pid] = df
     last = {k: d.close.iloc[-1] for k, d in data.items()}
+    done = {k: d.iloc[:-1].reset_index(drop=True) for k, d in data.items()}   # completed candles only
 
-    # 1) manage open positions on newly completed bars
+    # 1) exits
     for pid in list(st["positions"]):
         pos = st["positions"][pid]
-        if pid not in data: continue
-        done = data[pid].iloc[:-1]
-        ex = None
-        for _, b in done[done.t > pos["last_t"]].iterrows():
+        if pid not in done: continue
+        d, ex = done[pid], None
+        for _, b in d[d.t > pos["last_t"]].iterrows():
             ex = check_exit(pos, b.high, b.low, b.close); pos["last_t"] = int(b.t)
             if ex is not None: break
         if ex is not None:
             ret = net_return(pos["entry"], ex)
-            st["cash"] += pos["qty"] * ex * (1 - CFG["slip"]) * (1 - CFG["fee"])
-            s = st["stats"][pos["strategy"]]; s["n"] += 1; s["sum"] += ret
             fees = pos["qty"] * pos["entry"] * CFG["fee"] + pos["qty"] * ex * CFG["fee"]
             pnl = pos["qty"] * ex * (1 - CFG["slip"]) * (1 - CFG["fee"]) - pos["qty"] * pos["entry"] * (1 + CFG["fee"])
+            st["cash"] += pos["qty"] * ex * (1 - CFG["slip"]) * (1 - CFG["fee"])
+            s = st["stats"][pos["strategy"]]; s["n"] += 1; s["sum"] += ret; s["pnl"] += pnl; s["wins"] += int(ret > 0)
             log_trade(dict(time=ts, pair=pid, strategy=pos["strategy"], entry=pos["entry"], exit=ex,
                            qty=pos["qty"], ret=ret, pnl=pnl, fees=fees))
-            print(f"  EXIT {pid} [{pos['strategy']}] {ret:+.2%}")
+            print(f"  EXIT  {pid} [{pos['strategy']}] {ret:+.2%}")
             del st["positions"][pid]
 
-    # 2) periodically re-optimize (and disable strategies that fail live)
-    if st["cycle"] % CFG["reopt_every"] == 1 or not st["params"]:
-        print("  optimizing strategies on recent history...")
-        hist = {pid: h for pid in pairs[:25] if (h := history(pid, 900)) is not None and len(h) > 400}
-        if hist: st["params"] = optimize(hist)
+    # 2) learn: pause strategies that lose, retry them later
+    for name, c in list(st["disabled"].items()):
+        if st["cycle"] - c >= CFG["pause_cycles"]:
+            del st["disabled"][name]; st["stats"][name] = blank_stats(); print(f"  retrying {name}")
     for name, s in st["stats"].items():
-        if s["n"] >= 20 and s["sum"] / (s["n"] + 10) < 0 and name in st["params"]:
-            print(f"  live results negative -> disabling {name}"); st["params"].pop(name)
+        if name != "random" and name not in st["disabled"] and s["n"] >= CFG["pause_after"] and s["sum"] / (s["n"] + 10) < 0:
+            st["disabled"][name] = st["cycle"]; print(f"  net-negative after {s['n']} trades -> pausing {name}")
 
-    # 3) risk checks
+    # 3) risk check
     eq = equity(st, last); st["peak"] = max(st["peak"], eq)
-    dd = 1 - eq / st["peak"]
-    if dd > CFG["max_drawdown"] and not st["halted"]:
-        st["halted"] = True; print(f"  !! KILL SWITCH: drawdown {dd:.1%}. No new entries.")
+    if 1 - eq / st["peak"] > CFG["max_drawdown"] and not st["halted"]:
+        st["halted"] = True; print("  !! KILL SWITCH: big drawdown. No new entries.")
 
-    # 4) look for entries on the last COMPLETED bar
+    # 4) entries: every active strategy looks across ALL scanned pairs
     if not st["halted"]:
-        for name, p in st["params"].items():
-            fn = STRATS[name][0]
-            for pid, df in data.items():
-                if pid in st["positions"] or len(st["positions"]) >= CFG["max_positions"]: continue
-                done = df.iloc[:-1].reset_index(drop=True)
-                if not bool(fn(done, p).fillna(False).iloc[-1]): continue
-                a = atr(done).iloc[-1]
+        for name, spec in STRATS.items():
+            if name in st["disabled"]: continue
+            p = spec["p"]
+            mine = sum(1 for q in st["positions"].values() if q["strategy"] == name)
+            try: cands = candidates(spec, done)
+            except Exception as e:
+                print(f"  {name} error: {e}"); continue
+            for pid in cands:
+                if mine >= CFG["per_strategy_max"] or len(st["positions"]) >= CFG["max_positions"]: break
+                if pid in st["positions"] or pid not in last: continue
+                a = None if "stop_pct" in p else atr(done[pid]).iloc[-1]
+                if a is not None and not a > 0: continue
                 entry = last[pid] * (1 + CFG["slip"])
                 pos = new_pos(entry, a, p)
-                risk_amt = eq * CFG["risk_per_trade"] * weight(st, name)
-                qty = risk_amt / (entry - pos["stop"])
+                qty = eq * CFG["risk_per_trade"] * weight(st, name) / (entry - pos["stop"])
                 qty = min(qty, eq * CFG["max_pos_pct"] / entry, st["cash"] / (entry * (1 + CFG["fee"])))
                 if qty * entry < 10: continue
                 st["cash"] -= qty * entry * (1 + CFG["fee"])
-                pos.update(qty=qty, strategy=name, last_t=int(done.t.iloc[-1]))
-                st["positions"][pid] = pos
-                print(f"  ENTER {pid} [{name}] ${qty * entry:,.0f} stop {pos['stop']:.4g}")
+                pos.update(qty=qty, strategy=name, last_t=int(done[pid].t.iloc[-1]))
+                st["positions"][pid] = pos; mine += 1
+                print(f"  ENTER {pid} [{name}] ${qty * entry:,.0f}")
 
     eq = equity(st, last)
-    print(f"  equity ${eq:,.2f} | cash ${st['cash']:,.2f} | open {len(st['positions'])} | "
-          f"drawdown {1 - eq / st['peak']:.1%} | enabled: {list(st['params']) or 'none'}")
+    print(f"  equity ${eq:,.2f} | cash ${st['cash']:,.2f} | open {len(st['positions'])} | paused: {list(st['disabled']) or 'none'}")
     record(st, last, eq, ts)
     save(st)
 
-
-def _js(o):
-    return o.item() if hasattr(o, "item") else str(o)
+# ---------------- OUTPUT FOR THE DASHBOARD ----------------
+def _js(o): return o.item() if hasattr(o, "item") else str(o)
 
 def record(st, last, eq, ts):
-    """Append equity point and write data.json for the dashboard."""
+    if not os.path.exists(TRADES_FILE):
+        pd.DataFrame(columns=TRADE_COLS).to_csv(TRADES_FILE, index=False)
     pd.DataFrame([dict(time=ts, equity=round(eq, 2))]).to_csv(
         EQUITY_FILE, mode="a", header=not os.path.exists(EQUITY_FILE), index=False)
-    trades = pd.read_csv(TRADES_FILE).to_dict("records") if os.path.exists(TRADES_FILE) else []
+    trades = pd.read_csv(TRADES_FILE).to_dict("records")
     curve = pd.read_csv(EQUITY_FILE).tail(3000).to_dict("records")
     positions = []
     for k, p in st["positions"].items():
         px = last.get(k, p["entry"])
         positions.append(dict(pair=k, strategy=p["strategy"], entry=p["entry"], last=px, qty=p["qty"],
-                              value=p["qty"] * px, pnl_pct=px / p["entry"] - 1,
-                              stop=p["stop"], target=p["tp"], bars=p["bars"]))
+                              value=p["qty"] * px, pnl_pct=px / p["entry"] - 1, stop=p["stop"], target=p["tp"], bars=p["bars"]))
     strategies = []
     for k, s_ in st["stats"].items():
-        strategies.append(dict(name=k, enabled=k in st["params"], n=s_["n"],
-                               avg=(s_["sum"] / s_["n"]) if s_["n"] else 0, weight=weight(st, k)))
-    out = dict(updated=ts, equity=eq, start_equity=CFG["start_equity"], cash=st["cash"], peak=st["peak"],
-               halted=st["halted"], cycle=st["cycle"], positions=positions, strategies=strategies,
-               trades=trades[-500:], curve=curve)
+        strategies.append(dict(name=k, paused=k in st["disabled"], enabled=k not in st["disabled"], n=s_["n"], wins=s_["wins"],
+                               pnl=s_["pnl"], avg=(s_["sum"] / s_["n"]) if s_["n"] else 0, weight=weight(st, k),
+                               open=sum(1 for q in st["positions"].values() if q["strategy"] == k)))
+    out = dict(updated=ts, equity=eq, start_equity=CFG["start_equity"], cash=st["cash"], peak=st["peak"], halted=st["halted"],
+               cycle=st["cycle"], positions=positions, strategies=strategies, trades=trades[-500:], curve=curve)
     json.dump(out, open(DATA_FILE, "w"), default=_js)
 
 def report():
     st = load()
-    print(f"cash ${st['cash']:,.2f} | open positions {len(st['positions'])} | halted {st['halted']}")
-    for k, s in st["stats"].items():
-        e = s["sum"] / s["n"] if s["n"] else 0
-        print(f"  {k}: {s['n']} trades, avg {e:+.2%}, weight {weight(st, k):.2f}")
+    print(f"cash ${st['cash']:,.2f} | open {len(st['positions'])} | halted {st['halted']}")
+    for k, s in sorted(st["stats"].items(), key=lambda kv: -kv[1]["pnl"]):
+        print(f"  {k:9s} {s['n']:3d} trades | P&L ${s['pnl']:+.2f} | wins {s['wins']}")
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if mode == "optimize":
-        pairs = scan()[:25]
-        hist = {p: h for p in pairs if (h := history(p, 900)) is not None and len(h) > 400}
-        print(f"Testing on {len(hist)} pairs:"); optimize(hist)
-    elif mode == "report":
-        report()
-    elif mode == "once":      # one cycle then exit (used by GitHub Actions)
-        cycle(load())
+    if mode == "report": report()
+    elif mode == "once": cycle(load())
     else:
         st = load()
         while True:
             try: cycle(st)
             except Exception as e: print("  cycle error:", e)
-            time.sleep(3600 - time.time() % 3600 + 30)   # wake 30s after each hour closes
+            time.sleep(3600 - time.time() % 3600 + 30)

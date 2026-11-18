@@ -87,7 +87,7 @@ h2{font-size:12px;font-weight:700;color:var(--mute);text-transform:uppercase;let
 </div>
 
 <h2>Open positions</h2><div class="card" id="pos"></div>
-<h2>Strategies</h2><div class="card" id="strat"></div>
+<h2>Strategy leaderboard</h2><div class="card" id="strat"></div>
 <h2>Trades by coin</h2><div class="card" id="coins"></div>
 <h2>Recent trades</h2><div class="card" id="hist"></div>
 </div>
@@ -126,7 +126,9 @@ async function live(){
   }catch(e){LIVE=false;renderAcct();}
 }
 async function load(){
-  try{const r=await fetch("data.json?t="+Date.now());if(!r.ok)throw 0;D=await r.json();}
+  try{const own=location.hostname.split(".")[0],rep=location.pathname.split("/")[1]||"Paper-bot";
+    let r=await fetch("https://raw.githubusercontent.com/"+own+"/"+rep+"/main/data.json?t="+Date.now());
+    if(!r.ok)r=await fetch("data.json?t="+Date.now());if(!r.ok)throw 0;D=await r.json();}
   catch(e){if(!D){$("empty").hidden=false;$("main").hidden=true;}return;}
   $("empty").hidden=true;$("main").hidden=false;render();
 }
@@ -194,8 +196,8 @@ function render(){
 
   renderPos();
 
-  $("strat").innerHTML=D.strategies.map(s=>`<div class="row" style="display:block"><div class="flex"><div class="a" style="font-weight:700;text-transform:capitalize">${esc(s.name)}<span class="pill ${s.enabled?"on":""}">${s.enabled?"enabled":"off"}</span></div><div class="r ${s.n?cls(s.avg):"mute"}">${s.n?pct(s.avg)+" avg":"-"}</div></div>
-    <div class="meter"><b style="width:${Math.min(100,s.weight/2*100)}%;background:${s.enabled?"linear-gradient(90deg,var(--acc),var(--acc2))":"var(--mute)"}"></b></div><div class="b" style="font-size:11px;color:var(--mute);margin-top:4px">${s.n} live trades | capital weight ${s.weight.toFixed(2)}x</div></div>`).join("");
+  $("strat").innerHTML=[...D.strategies].sort((x,y)=>(y.pnl||0)-(x.pnl||0)).map((s,i)=>{const wr=s.n?Math.round(100*(s.wins||0)/s.n):null,pn=s.pnl||0;
+    return `<div class="row" style="display:block"><div class="flex"><div class="a" style="font-weight:700;text-transform:capitalize">${i+1}. ${esc(s.name)}<span class="pill ${s.paused?"":"on"}">${s.paused?"paused":(s.name==="random"?"control":"active")}</span></div><div class="r ${s.n?cls(pn):"mute"}">${s.n?usd(pn):"-"}</div></div><div class="b" style="font-size:12px;color:var(--mute);margin-top:4px">${s.n} closed | ${s.open||0} open | win rate ${wr===null?"-":wr+"%"} | avg ${s.n?pct(s.avg):"-"}</div></div>`;}).join("");
 
   const by={};T.forEach(t=>{(by[t.pair]=by[t.pair]||{n:0,p:0});by[t.pair].n++;by[t.pair].p+=t.pnl||0;});P.forEach(p=>{(by[p.pair]=by[p.pair]||{n:0,p:0});by[p.pair].n++;});
   const cs=Object.entries(by).sort((a,b)=>b[1].n-a[1].n);
