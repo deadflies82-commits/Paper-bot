@@ -1,0 +1,22 @@
+{
+ "cash": 1000.0,
+ "peak": 1000.0,
+ "positions": {},
+ "params": {},
+ "stats": {
+  "breakout": {
+   "n": 0,
+   "sum": 0.0
+  },
+  "meanrev": {
+   "n": 0,
+   "sum": 0.0
+  },
+  "trend": {
+   "n": 0,
+   "sum": 0.0
+  }
+ },
+ "cycle": 1,
+ "halted": false
+}
