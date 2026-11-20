@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
 Coinbase spot PAPER trading TOURNAMENT. Real market data, fake money, no API keys, no real orders.
-9 strategies (some deliberately wild) trade at once from one $1,000 paper wallet.
-The Dashboard leaderboard shows which ones actually make money. Losers get paused, then retried later.
-
+Strategies trade from one paper wallet. Losers get paused, winners get more capital.
   python bot.py once     # one cycle (used by GitHub Actions every hour)
-  python bot.py run      # loop forever (on a computer)
   python bot.py report   # print the leaderboard
 """
 import sys, json, time, os, random
@@ -18,12 +15,13 @@ CFG = dict(
     start_equity=1000.0,
     fee=0.006,            # per side. Verify your Coinbase fee tier.
     slip=0.001,           # per side slippage assumption
-    risk_per_trade=0.02,  # aggressive: risk 2% of equity per trade
+    risk_per_trade=0.02,
     max_pos_pct=0.10,     # max 10% of the wallet in one coin
+    max_deploy=0.85,      # FIX: never have more than 90% of equity invested; keep a cash reserve
     max_positions=12, per_strategy_max=2,
-    max_drawdown=0.50,    # paper money: only stop new trades after a 50% drop
+    max_drawdown=0.50,
     top_pairs=80, min_usd_vol=150_000,
-    pause_after=25, pause_cycles=48,   # pause a strategy that is net-negative after 25 trades; retry 48h later
+    pause_after=25, pause_cycles=48,
 )
 STATE_FILE, TRADES_FILE, EQUITY_FILE, DATA_FILE = "state.json", "trades.csv", "equity.csv", "data.json"
 API = "https://api.exchange.coinbase.com"
@@ -59,7 +57,6 @@ def history(pid, bars=300, gran=3600):
     return df.tail(bars).reset_index(drop=True)
 
 def scan():
-    """Check ALL Coinbase USD pairs; return the most active ones (by 24h dollar volume)."""
     ranked = []
     for pid in usd_pairs():
         try:
@@ -88,22 +85,22 @@ def atr(df, n=14):
 def vol_x(df, m): return df.volume > m * df.volume.rolling(24).mean()
 
 # ---------------- STRATEGIES ----------------
-def sig_breakout(df, p):   # price breaks its recent high on heavy volume
+def sig_breakout(df, p):
     return (df.close > df.high.rolling(p["n"]).max().shift(1)) & vol_x(df, 1.5) & (df.close > ema(df.close, 100))
-def sig_meanrev(df, p):    # oversold bounce
+def sig_meanrev(df, p):
     m, s = df.close.rolling(20).mean(), df.close.rolling(20).std()
     return (rsi(df.close) < p["rsi"]) & (df.close < m - 2 * s)
-def sig_trend(df, p):      # fast average crosses above slow average
+def sig_trend(df, p):
     f, sl = ema(df.close, p["fast"]), ema(df.close, p["slow"])
     return (f > sl) & (f.shift() <= sl.shift()) & (rsi(df.close) > 50)
-def sig_spike(df, p):      # sharp rise on heavy volume, still above trend
+def sig_spike(df, p):
     ret = df.close / df.close.shift(p["n"]) - 1
     return (ret > p["thr"]) & vol_x(df, p["vm"]) & (rsi(df.close) < 80) & (df.close > ema(df.close, 50))
-def sig_knife(df, p):      # WILD: catch a falling knife (dropped hard in 24h and deeply oversold)
+def sig_knife(df, p):
     return (df.close / df.close.shift(24) - 1 < -p["drop"]) & (rsi(df.close) < 25)
-def sig_scalp(df, p):      # WILD: tiny quick trades on a 1-hour pop with volume
+def sig_scalp(df, p):
     return (df.close / df.close.shift(1) - 1 > p["thr"]) & vol_x(df, p["vm"])
-def sig_moon(df, p):       # WILD: chase coins already up 10%+ in a day on huge volume
+def sig_moon(df, p):
     return (df.close / df.close.shift(24) - 1 > p["thr"]) & vol_x(df, p["vm"])
 
 ATR_EXIT = dict(stop_atr=2, tp_atr=6, max_hold=72)
@@ -115,10 +112,11 @@ STRATS = {
     "trend":    dict(kind="sig", fn=sig_trend,    p=dict(fast=12, slow=48, **ATR_EXIT)),
     "spike":    dict(kind="sig", fn=sig_spike,    p=dict(n=6, thr=0.03, vm=2.0, **ATR_EXIT)),
     "knife":    dict(kind="sig", fn=sig_knife,    p=dict(drop=0.08, **pct_exit(.06, .08, 48))),
-    "scalp":    dict(kind="sig", fn=sig_scalp,    p=dict(thr=0.012, vm=2.0, **pct_exit(.012, .02, 6))),
+    # FIX: scalp stop/target now clear the ~1.4% round-trip cost, so the strategy is not structurally losing
+    "scalp":    dict(kind="sig", fn=sig_scalp,    p=dict(thr=0.012, vm=2.0, **pct_exit(.02, .05, 6))),
     "moonshot": dict(kind="sig", fn=sig_moon,     p=dict(thr=0.10, vm=3.0, **pct_exit(.08, .50, 72))),
-    "gainers":  dict(kind="rank",                 p=dict(k=2, min=0.03, **pct_exit(.05, .15, 48))),   # top 24h gainers across ALL pairs
-    "random":   dict(kind="random",               p=dict(**pct_exit(.03, .06, 24))),                  # CONTROL: buys at random. Real strategies must beat this.
+    "gainers":  dict(kind="rank",                 p=dict(k=2, min=0.03, **pct_exit(.05, .15, 48))),
+    "random":   dict(kind="random",               p=dict(**pct_exit(.03, .06, 24))),
 }
 
 def candidates(spec, done, p=None):
@@ -137,7 +135,7 @@ def check_exit(pos, high, low, close):
     if low <= pos["stop"]: return pos["stop"]
     if high >= pos["tp"]: return pos["tp"]
     pos["hi"] = max(pos["hi"], high)
-    pos["stop"] = max(pos["stop"], pos["hi"] - pos["stop_atr"] * pos["atr"])   # trailing stop
+    pos["stop"] = max(pos["stop"], pos["hi"] - pos["stop_atr"] * pos["atr"])
     if pos["bars"] >= pos["max_hold"]: return close
     return None
 
@@ -151,7 +149,6 @@ def new_pos(entry, a, p):
 def net_return(entry, exit_px):
     return exit_px * (1 - CFG["slip"]) / entry * (1 - CFG["fee"]) ** 2 - 1
 
-
 # ---------------- OPTIMIZATION LAB ----------------
 def _atr_exits(): return [dict(stop_atr=a, tp_atr=b, max_hold=h) for a in (2, 3) for b in (4, 8) for h in (48, 96)]
 def _pct(stops, tps, holds): return [pct_exit(s_, t_, h_) for s_ in stops for t_ in tps for h_ in holds]
@@ -161,12 +158,11 @@ LAB = {
     "trend":    ([dict(fast=f, slow=sl) for f, sl in ((8, 32), (12, 48), (24, 96))], _atr_exits()),
     "spike":    ([dict(n=n, thr=t, vm=2.0) for n in (3, 6, 12) for t in (.02, .03, .05)], _atr_exits()),
     "knife":    ([dict(drop=d) for d in (.05, .08, .12)], _pct((.04, .06, .10), (.06, .10, .15), (24, 48))),
-    "scalp":    ([dict(thr=t, vm=2.0) for t in (.008, .012, .02)], _pct((.008, .012, .02), (.015, .025, .04), (4, 8))),
+    "scalp":    ([dict(thr=t, vm=2.0) for t in (.008, .012, .02)], _pct((.02, .03), (.04, .05, .08), (4, 8))),
     "moonshot": ([dict(thr=t, vm=3.0) for t in (.06, .10, .15)], _pct((.05, .08, .12), (.5,), (48, 96))),
 }
 
 def backtest(df, sig, a, p):
-    """Replay one strategy on one coin's history. Returns [(position in history 0-1, net return after fees)]."""
     o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
     sg = sig.fillna(False).values; av = None if a is None else a.values
     out, i, n = [], 0, len(df)
@@ -186,7 +182,6 @@ def backtest(df, sig, a, p):
     return out
 
 def run_lab(pairs, log=print):
-    """Replay every strategy with many setting combinations on real Coinbase history; keep the best per strategy."""
     dfs = {}
     for pid in pairs:
         h = history(pid, 900)
@@ -194,26 +189,28 @@ def run_lab(pairs, log=print):
     atrs = {k: atr(d) for k, d in dfs.items()}
     results, tested, notes = [], 0, []
     for name, (sgrid, egrid) in LAB.items():
-      try:
-        fn, best, max_n = STRATS[name]["fn"], None, 0
-        for sp in sgrid:
-            sigs = {k: fn(d, sp) for k, d in dfs.items()}
-            for ep in egrid:
-                tested += 1
-                p = {**sp, **ep}; use_atr = "stop_pct" not in ep
-                allr = []
-                for k, d in dfs.items(): allr += backtest(d, sigs[k], atrs[k] if use_atr else None, p)
-                n = len(allr); max_n = max(max_n, n)
-                if n < 10: continue
-                rets = [r for _, r in allr]; recent = [r for f, r in allr if f >= 0.7]
-                avg = float(np.mean(rets)); score = avg * np.sqrt(n)
-                if best is None or score > best[0]:
-                    best = (score, dict(name=name, params=p, n=n, avg=avg, win=float(np.mean([r > 0 for r in rets])),
-                                        test_n=len(recent), test_avg=float(np.mean(recent)) if len(recent) >= 5 else None))
-        if best: results.append(best[1]); log(f"  lab {name}: best avg {best[1]['avg']:+.2%} over {best[1]['n']} trades")
-        else: notes.append(f"{name}: at most {max_n} trades")
-      except Exception as e:
-        notes.append(f"{name}: error {type(e).__name__}: {e}"[:120]); log(f"  lab {name} error: {e}")
+        try:
+            fn, best, max_n = STRATS[name]["fn"], None, 0
+            for sp in sgrid:
+                sigs = {k: fn(d, sp) for k, d in dfs.items()}
+                for ep in egrid:
+                    tested += 1
+                    p = {**sp, **ep}; use_atr = "stop_pct" not in ep
+                    allr = []
+                    for k, d in dfs.items(): allr += backtest(d, sigs[k], atrs[k] if use_atr else None, p)
+                    n = len(allr); max_n = max(max_n, n)
+                    if n < 10: continue
+                    rets = [r for _, r in allr]; recent = [r for f, r in allr if f >= 0.7]
+                    # FIX: a setting must also win on the recent 30% of data, or it is treated as overfit and ignored
+                    if len(recent) < 5 or float(np.mean(recent)) <= 0: continue
+                    avg = float(np.mean(rets)); score = avg * np.sqrt(n)
+                    if best is None or score > best[0]:
+                        best = (score, dict(name=name, params=p, n=n, avg=avg, win=float(np.mean([r > 0 for r in rets])),
+                                            test_n=len(recent), test_avg=float(np.mean(recent))))
+            if best: results.append(best[1]); log(f"  lab {name}: best avg {best[1]['avg']:+.2%} over {best[1]['n']} trades")
+            else: notes.append(f"{name}: no setting won on both history and recent data (max {max_n} trades)")
+        except Exception as e:
+            notes.append(f"{name}: error {type(e).__name__}: {e}"[:120]); log(f"  lab {name} error: {e}")
     return dict(updated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), pairs=len(dfs), tested=tested,
                 results=results, notes=notes[:9])
 
@@ -237,7 +234,6 @@ def log_trade(row):
     pd.DataFrame([row]).to_csv(TRADES_FILE, mode="a", header=not os.path.exists(TRADES_FILE), index=False)
 
 def weight(st, name):
-    """Learning: strategies that win live get more capital (up to 2x); losers shrink (down to 0.25x)."""
     if name == "random": return 1.0
     s = st["stats"][name]
     return float(np.clip(1 + (s["sum"] / (s["n"] + 10)) * 50, 0.25, 2.0))
@@ -251,7 +247,7 @@ def cycle(st):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     print(f"\n[{ts}] cycle {st['cycle']}: scanning all USD pairs...")
     pairs = scan()
-    if st["cycle"] - st.get("lab_cycle", -999) >= 24:     # optimization lab: once a day (retries hourly if it fails)
+    if st["cycle"] - st.get("lab_cycle", -999) >= 24:
         print("  running optimization lab on real history...")
         try:
             lab = run_lab(pairs[:30])
@@ -268,7 +264,7 @@ def cycle(st):
         df = history(pid, bars=300)
         if df is not None and len(df) > 60: data[pid] = df
     last = {k: d.close.iloc[-1] for k, d in data.items()}
-    done = {k: d.iloc[:-1].reset_index(drop=True) for k, d in data.items()}   # completed candles only
+    done = {k: d.iloc[:-1].reset_index(drop=True) for k, d in data.items()}
 
     # 1) exits
     for pid in list(st["positions"]):
@@ -289,7 +285,7 @@ def cycle(st):
             print(f"  EXIT  {pid} [{pos['strategy']}] {ret:+.2%}")
             del st["positions"][pid]
 
-    # 2) learn: pause strategies that lose, retry them later
+    # 2) learn: pause losers, retry later
     for name, c in list(st["disabled"].items()):
         if st["cycle"] - c >= CFG["pause_cycles"]:
             del st["disabled"][name]; st["stats"][name] = blank_stats(); print(f"  retrying {name}")
@@ -298,11 +294,13 @@ def cycle(st):
             st["disabled"][name] = st["cycle"]; print(f"  net-negative after {s['n']} trades -> pausing {name}")
 
     # 3) risk check
+    if st["cash"] < -1e-6:
+        st["halted"] = True; print("  !! WALLET ERROR: cash went negative. Entries halted.")
     eq = equity(st, last); st["peak"] = max(st["peak"], eq)
     if 1 - eq / st["peak"] > CFG["max_drawdown"] and not st["halted"]:
         st["halted"] = True; print("  !! KILL SWITCH: big drawdown. No new entries.")
 
-    # 4) entries: every active strategy looks across ALL scanned pairs
+    # 4) entries
     if not st["halted"]:
         for name, spec in STRATS.items():
             if name in st["disabled"]: continue
@@ -319,7 +317,11 @@ def cycle(st):
                 entry = last[pid] * (1 + CFG["slip"])
                 pos = new_pos(entry, a, p)
                 qty = eq * CFG["risk_per_trade"] * weight(st, name) / (entry - pos["stop"])
-                qty = min(qty, eq * CFG["max_pos_pct"] / entry, st["cash"] / (entry * (1 + CFG["fee"])))
+                # FIX: total invested can never exceed max_deploy of equity; cash can never go negative
+                invested = sum(q["qty"] * last.get(k, q["entry"]) for k, q in st["positions"].items())
+                room = max(0.0, eq * CFG["max_deploy"] - invested)
+                qty = min(qty, eq * CFG["max_pos_pct"] / entry, room / entry,
+                          st["cash"] / (entry * (1 + CFG["fee"])))
                 if qty * entry < 10: continue
                 st["cash"] -= qty * entry * (1 + CFG["fee"])
                 pos.update(qty=qty, strategy=name, last_t=int(done[pid].t.iloc[-1]))
@@ -331,7 +333,7 @@ def cycle(st):
     record(st, last, eq, ts)
     save(st)
 
-# ---------------- OUTPUT FOR THE DASHBOARD ----------------
+# ---------------- DASHBOARD OUTPUT ----------------
 def _js(o): return o.item() if hasattr(o, "item") else str(o)
 
 def record(st, last, eq, ts):
@@ -363,12 +365,6 @@ def report():
         print(f"  {k:9s} {s['n']:3d} trades | P&L ${s['pnl']:+.2f} | wins {s['wins']}")
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "once"
     if mode == "report": report()
-    elif mode == "once": cycle(load())
-    else:
-        st = load()
-        while True:
-            try: cycle(st)
-            except Exception as e: print("  cycle error:", e)
-            time.sleep(3600 - time.time() % 3600 + 30)
+    else: cycle(load())
